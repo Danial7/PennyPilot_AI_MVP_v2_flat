@@ -245,7 +245,8 @@ def visible_df():
     return df[df["currency"] == st.session_state.currency].copy()
 
 
-def build_personal_coach(budget, df, currency, goals):
+def build_financial_agent(budget, df, currency, goals):
+    """Calculate financial facts deterministically; the optional LLM only explains them."""
     spent = float(df["amount"].sum()) if not df.empty else 0.0
     remaining = budget - spent
     ratio = spent / budget if budget > 0 else 0.0
@@ -253,56 +254,121 @@ def build_personal_coach(budget, df, currency, goals):
     month_days = pd.Timestamp(today).days_in_month
     day_number = today.day
     projected = spent / day_number * month_days if day_number and spent else 0.0
-    lines = []
+
+    context = {
+        "spent": spent, "remaining": remaining, "ratio": ratio,
+        "projected": projected, "transactions": len(df),
+        "top_category": "", "top_category_amount": 0.0,
+        "top_category_pct": 0.0, "discretionary": 0.0,
+        "essential": 0.0, "category_totals": {},
+        "largest_transaction": None, "goal_analysis": [],
+        "recommended_actions": [], "budget_status": "No data"
+    }
     if df.empty:
-        lines.append("There is not enough recorded spending yet to identify your personal spending pattern. Add several expenses, especially recurring bills, before relying on the coach.")
-        return lines, {}
+        return [], context
 
     cats = df.groupby("category")["amount"].sum().sort_values(ascending=False)
     discretionary = float(df[df["category"].isin(DISCRETIONARY_CATEGORIES)]["amount"].sum())
     essential = float(df[df["category"].isin(ESSENTIAL_CATEGORIES)]["amount"].sum())
-    top_cat = cats.index[0]
-    top_val = float(cats.iloc[0])
+    top_cat, top_val = str(cats.index[0]), float(cats.iloc[0])
+    largest = df.nlargest(1, "amount").iloc[0]
 
     if ratio >= 1:
-        lines.append(f"You have recorded {money(spent, currency)} against a {money(budget, currency)} monthly budget — {money(abs(remaining), currency)} over the limit so far.")
+        status = "Over budget"
+    elif projected > budget and day_number < month_days:
+        status = "At risk"
     elif ratio >= 0.85:
-        lines.append(f"You have used {ratio:.0%} of your budget with time still left in the month. Your remaining recorded room is {money(remaining, currency)}.")
+        status = "Watch"
     else:
-        lines.append(f"You have recorded {ratio:.0%} of your monthly budget, leaving {money(remaining, currency)}. This is based only on expenses entered into PennyPilot.")
+        status = "On track"
 
-    lines.append(f"{top_cat} is your largest recorded category at {money(top_val, currency)} ({top_val / spent:.0%} of recorded spending).")
-    if discretionary > 0:
-        lines.append(f"Recorded discretionary spending is {money(discretionary, currency)} ({discretionary / spent:.0%} of spending), mainly across {', '.join(cats[cats.index.isin(DISCRETIONARY_CATEGORIES)].index[:3])}.")
-    else:
-        lines.append(f"Your recorded spending is concentrated in essential categories ({money(essential, currency)}), so the coach is not treating essential bills as easy cuts.")
+    context.update({
+        "top_category": top_cat, "top_category_amount": top_val,
+        "top_category_pct": top_val / spent if spent else 0,
+        "discretionary": discretionary, "essential": essential,
+        "category_totals": {str(k): float(v) for k, v in cats.items()},
+        "budget_status": status,
+        "largest_transaction": {
+            "merchant": str(largest["merchant"]),
+            "amount": float(largest["amount"]),
+            "category": str(largest["category"]),
+            "date": str(largest["date"])
+        }
+    })
 
-    if projected > budget and day_number < month_days:
-        lines.append(f"At the current pace, recorded spending would reach roughly {money(projected, currency)} by month-end, which is about {money(projected - budget, currency)} above budget if the pace continues.")
-    elif day_number < month_days:
-        lines.append(f"At the current pace, recorded spending would be roughly {money(projected, currency)} by month-end. That projection is only a pace estimate, not a forecast of unavoidable costs.")
-
-    if len(df) >= 3:
-        largest = df.nlargest(1, "amount").iloc[0]
-        lines.append(f"Your largest recorded transaction is {money(float(largest['amount']), currency)} at {largest['merchant']}. Review whether it was planned, one-off, or recurring before changing your normal spending plan.")
-
-    goal_notes = []
+    # Connect discretionary spending to savings goals.
     for goal in goals:
         if goal.get("currency") != currency:
             continue
-        gap = max(float(goal.get("target", 0)) - float(goal.get("saved", 0)), 0)
+        target = float(goal.get("target", 0))
+        saved = float(goal.get("saved", 0))
         monthly = float(goal.get("monthly", 0))
-        if gap and monthly:
-            goal_notes.append(f"{goal['name']}: {money(gap, currency)} remaining at {money(monthly, currency)}/month")
-    if goal_notes:
-        lines.append("Active goal context: " + "; ".join(goal_notes[:3]) + ".")
+        gap = max(target - saved, 0)
+        current_months = math.ceil(gap / monthly) if gap and monthly > 0 else 0
+        opportunities = []
+        for category in DISCRETIONARY_CATEGORIES:
+            value = float(cats.get(category, 0))
+            if value > 0:
+                saving = value * 0.20
+                new_monthly = monthly + saving
+                new_months = math.ceil(gap / new_monthly) if gap and new_monthly > 0 else 0
+                opportunities.append({
+                    "category": category,
+                    "potential_saving": saving,
+                    "new_monthly": new_monthly,
+                    "new_months": new_months,
+                    "months_saved": max(current_months - new_months, 0)
+                })
+        opportunities.sort(key=lambda x: x["potential_saving"], reverse=True)
+        context["goal_analysis"].append({
+            "name": str(goal.get("name", "Goal")),
+            "gap": gap, "monthly": monthly,
+            "current_months": current_months,
+            "opportunities": opportunities[:3]
+        })
 
-    context = {
-        "spent": spent, "remaining": remaining, "ratio": ratio, "projected": projected,
-        "top_category": top_cat, "top_category_amount": top_val, "discretionary": discretionary,
-        "essential": essential, "category_totals": cats.to_dict(), "transactions": len(df),
-    }
+    actions = []
+    if ratio >= 1:
+        actions.append(f"Reduce discretionary spending until the recorded {money(abs(remaining), currency)} budget gap is recovered.")
+    elif projected > budget and day_number < month_days:
+        actions.append(f"Your current pace points to about {money(projected, currency)} by month-end; protect the remaining {money(max(remaining, 0), currency)}.")
+    elif ratio >= 0.85:
+        actions.append(f"Keep the remaining {money(max(remaining, 0), currency)} for essential or already-planned expenses.")
+    else:
+        actions.append(f"Keep at least {money(max(remaining, 0), currency)} uncommitted until the end of the budget period.")
+
+    discretionary_ranked = sorted(
+        [(c, float(cats.get(c, 0))) for c in DISCRETIONARY_CATEGORIES if float(cats.get(c, 0)) > 0],
+        key=lambda x: x[1], reverse=True
+    )
+    if discretionary_ranked:
+        c, value = discretionary_ranked[0]
+        actions.append(f"Review {c}: a 20% reduction would free about {money(value * 0.20, currency)} based on recorded spending.")
+    else:
+        actions.append("Most recorded spending is essential, so the coach is avoiding arbitrary cuts to essential categories.")
+
+    best = None
+    for goal in context["goal_analysis"]:
+        for opp in goal["opportunities"]:
+            if best is None or opp["months_saved"] > best[1]["months_saved"]:
+                best = (goal, opp)
+    if best and best[1]["potential_saving"] > 0:
+        goal, opp = best
+        actions.append(f"For {goal['name']}, redirecting about {money(opp['potential_saving'], currency)}/month from {opp['category']} could shorten the simple goal estimate from {goal['current_months']} to {opp['new_months']} month(s).")
+    context["recommended_actions"] = actions[:3]
+
+    lines = [
+        f"You have recorded {money(spent, currency)} against a {money(budget, currency)} monthly budget ({ratio:.0%} recorded).",
+        f"{top_cat} is your largest recorded category at {money(top_val, currency)} ({top_val / spent:.0%} of recorded spending).",
+        f"At the current pace, recorded spending would be roughly {money(projected, currency)} by month-end; this is a pace estimate, not a guaranteed forecast.",
+        f"Your largest recorded transaction is {money(float(largest['amount']), currency)} at {largest['merchant']} ({largest['category']})."
+    ]
+    if discretionary:
+        lines.append(f"Recorded discretionary spending is {money(discretionary, currency)} ({discretionary / spent:.0%} of spending).")
     return lines, context
+
+# Compatibility for any older reference.
+build_personal_coach = build_financial_agent
 
 
 def investment_education(country, currency, remaining):
@@ -550,53 +616,156 @@ with tabs[3]:
         st.info("No goals added yet.")
 
 with tabs[4]:
-    st.subheader("Your money coach")
-    coach_lines, coach_context = build_personal_coach(st.session_state.budget, df, st.session_state.currency, st.session_state.goals)
-    if coach_context:
+    st.subheader("🧠 Your Financial Agent")
+    st.caption("PennyPilot calculates the financial facts first. Optional AI explains those facts in plain language.")
+
+    coach_lines, coach_context = build_financial_agent(
+        st.session_state.budget, df, st.session_state.currency, st.session_state.goals
+    )
+
+    if df.empty:
+        st.info("Add several expenses first. The Financial Agent needs recorded spending to produce meaningful personal analysis.")
+    else:
+        st.markdown("### 🔎 1. Financial Snapshot")
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("Recorded spending", money(coach_context["spent"], st.session_state.currency))
         k2.metric("Budget used", f"{coach_context['ratio']:.0%}")
-        k3.metric("Top category", coach_context["top_category"])
-        k4.metric("Discretionary", money(coach_context["discretionary"], st.session_state.currency))
-    st.markdown("**Personalized budget analysis**")
-    for advice in coach_lines:
-        st.write("• " + advice)
-    if not df.empty:
-        st.markdown("**Where your money is going**")
-        cat = df.groupby("category")["amount"].sum().sort_values(ascending=False)
-        st.dataframe(pd.DataFrame({"Category": cat.index, "Recorded amount": [money(x, st.session_state.currency) for x in cat.values], "% of spending": [f"{x / cat.sum():.0%}" for x in cat.values]}), use_container_width=True, hide_index=True)
-    st.markdown("**Investing and savings education**")
-    st.write(investment_education(st.session_state.country, st.session_state.currency, remaining))
+        k3.metric("Budget health", coach_context["budget_status"])
+        k4.metric("Month-end pace", money(coach_context["projected"], st.session_state.currency))
+
+        status = coach_context["budget_status"]
+        if status == "Over budget":
+            st.error("Recorded spending has already exceeded the stated monthly budget.")
+        elif status == "At risk":
+            st.warning("Your current spending pace indicates a possible month-end budget overrun.")
+        elif status == "Watch":
+            st.warning("A large portion of the budget has already been recorded.")
+        else:
+            st.success("Recorded spending is currently below the budget threshold.")
+
+        st.markdown("### 📊 2. What's Driving Your Spending?")
+        cat = pd.Series(coach_context["category_totals"]).sort_values(ascending=False)
+        left, right = st.columns(2)
+        with left:
+            st.dataframe(
+                pd.DataFrame({
+                    "Category": cat.index,
+                    "Recorded amount": [money(x, st.session_state.currency) for x in cat.values],
+                    "% of spending": [f"{x / cat.sum():.0%}" for x in cat.values]
+                }),
+                use_container_width=True, hide_index=True
+            )
+        with right:
+            fig = px.bar(
+                pd.DataFrame({"Category": cat.index, "Amount": cat.values}),
+                x="Amount", y="Category", orientation="h",
+                title="Recorded spending by category"
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("### 🎯 3. What Should You Change?")
+        for i, action in enumerate(coach_context["recommended_actions"], 1):
+            st.write(f"**{i}.** {action}")
+
+        lt = coach_context.get("largest_transaction")
+        if lt:
+            st.info(
+                f"Largest recorded transaction: **{lt['merchant']} — {money(lt['amount'], st.session_state.currency)}** "
+                f"({lt['category']}). Review whether it was planned, one-off, or recurring."
+            )
+
+        st.markdown("### 🎯 4. Goal Impact")
+        if coach_context["goal_analysis"]:
+            for goal in coach_context["goal_analysis"]:
+                st.markdown(f"**{goal['name']}**")
+                st.write(
+                    f"Remaining: **{money(goal['gap'], st.session_state.currency)}** · "
+                    f"Current contribution: **{money(goal['monthly'], st.session_state.currency)}/month** · "
+                    f"Estimated time: **{goal['current_months']} month(s)**."
+                )
+                if goal["opportunities"]:
+                    best = goal["opportunities"][0]
+                    st.success(
+                        f"A 20% reduction in {best['category']} would free about "
+                        f"{money(best['potential_saving'], st.session_state.currency)}/month "
+                        f"and could shorten the simple estimate by about {best['months_saved']} month(s)."
+                    )
+        else:
+            st.caption("Add a savings goal to see how spending changes could affect your target timeline.")
+
+        st.markdown("### 📅 5. Your Next 7 Days")
+        top_disc = sorted(
+            [(c, float(coach_context["category_totals"].get(c, 0))) for c in DISCRETIONARY_CATEGORIES
+             if float(coach_context["category_totals"].get(c, 0)) > 0],
+            key=lambda x: x[1], reverse=True
+        )
+        weekly = []
+        if top_disc:
+            c, value = top_disc[0]
+            weekly.append(f"Set a personal ceiling for {c}; recorded monthly spending is already {money(value, st.session_state.currency)}.")
+        weekly.append(f"Before adding a non-essential expense, check that {money(max(coach_context['remaining'], 0), st.session_state.currency)} remains available.")
+        if coach_context["goal_analysis"]:
+            weekly.append(f"Keep your {coach_context['goal_analysis'][0]['name']} contribution separate from everyday spending if possible.")
+        for item in weekly[:3]:
+            st.write("• " + item)
 
     st.divider()
-    st.markdown("**Optional AI explanation of your actual spending**")
-    st.caption("The AI receives a compact summary of your recorded transactions, budget, country, goals and category breakdown. It is not asked to invent missing data or give security-specific buy/sell advice.")
-    if st.button("Generate personalized AI explanation", type="primary"):
-        category_totals = coach_context.get("category_totals", {}) if coach_context else {}
-        goal_context = [{"name": g.get("name"), "target": g.get("target"), "saved": g.get("saved"), "monthly": g.get("monthly"), "currency": g.get("currency")} for g in st.session_state.goals]
-        prompt = f"""
-User financial context:
-- Country: {st.session_state.country}
-- Currency: {st.session_state.currency}
-- Monthly budget: {st.session_state.budget:.2f}
-- Recorded spending: {coach_context.get('spent', 0):.2f}
-- Remaining budget: {coach_context.get('remaining', st.session_state.budget):.2f}
-- Budget used: {coach_context.get('ratio', 0):.0%}
-- Current date: {date.today().isoformat()}
-- Recorded transaction count: {len(df)}
-- Category totals: {category_totals}
-- Savings goals: {goal_context}
-- Month-end pace estimate: {coach_context.get('projected', 0):.2f}
+    st.markdown("### 🤖 Optional AI Explanation")
+    st.caption("AI receives calculated financial facts; it is not asked to invent transactions or provide security-specific buy/sell instructions.")
 
-Write a concise, specific coaching note based only on these numbers. Identify the biggest spending driver, whether the current pace is compatible with the stated budget, one category that deserves review, and three practical next steps. Mention the relevant savings goal(s) when present. If there is not enough data, say exactly what is missing. Do not recommend a particular stock, crypto token, fund, gold product, or security.
+    if st.button("Generate personalized AI explanation", type="primary", disabled=df.empty):
+        prompt = f"""
+You are the explanation layer of PennyPilot AI.
+
+Use ONLY these calculated facts. Do not invent transactions or financial history.
+Do not recommend a particular stock, crypto token, fund, security, or gold product.
+Do not give buy/sell instructions. Keep the advice practical and non-judgmental.
+
+Country: {st.session_state.country}
+Currency: {st.session_state.currency}
+Monthly budget: {st.session_state.budget:.2f}
+Recorded spending: {coach_context['spent']:.2f}
+Remaining budget: {coach_context['remaining']:.2f}
+Budget used: {coach_context['ratio']:.0%}
+Budget health: {coach_context['budget_status']}
+Month-end pace estimate: {coach_context['projected']:.2f}
+Transaction count: {len(df)}
+Largest category: {coach_context['top_category']}
+Largest category amount: {coach_context['top_category_amount']:.2f}
+Largest category share: {coach_context['top_category_pct']:.0%}
+Discretionary spending: {coach_context['discretionary']:.2f}
+Essential spending: {coach_context['essential']:.2f}
+Category totals: {coach_context['category_totals']}
+Largest transaction: {coach_context['largest_transaction']}
+Goal analysis: {coach_context['goal_analysis']}
+Recommended actions: {coach_context['recommended_actions']}
+
+Respond using exactly these sections:
+## My financial picture
+2-3 sentences based on the numbers.
+
+## What is driving it
+3 bullets tied to actual categories or numbers.
+
+## What I would focus on next
+3 concrete actions.
+
+## Impact on my goal
+Explain the most relevant goal effect, or say no goal was provided.
+
+## One thing to watch
+One specific caution based on the data.
+
+End by saying the analysis uses only recorded expenses and is educational, not regulated financial advice.
 """
-        with st.spinner("Generating personalized explanation..."):
+        with st.spinner("Analyzing your actual spending and goals..."):
             answer, error = try_llm_advice(prompt)
         if answer:
             st.markdown(answer)
         else:
             st.error(error or "The AI explanation could not be generated.")
-            st.info("The personalized rules-based coach above remains available even when the optional AI service is unavailable.")
+            st.info("The deterministic Financial Agent above remains available without the AI service.")
+
 
 with tabs[5]:
     st.subheader("Export and session data")
