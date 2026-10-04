@@ -1,0 +1,1129 @@
+import io
+import math
+import re
+import uuid
+from datetime import date, datetime
+
+import pandas as pd
+import plotly.express as px
+import requests
+import streamlit as st
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+
+try:
+    import pytesseract
+    OCR_AVAILABLE = True
+except Exception:
+    OCR_AVAILABLE = False
+
+APP_NAME = "PennyPilot AI"
+CURRENCIES = {
+    "PKR — Pakistani Rupee": "PKR", "USD — US Dollar": "USD", "EUR — Euro": "EUR",
+    "GBP — British Pound": "GBP", "AED — UAE Dirham": "AED", "SAR — Saudi Riyal": "SAR",
+    "INR — Indian Rupee": "INR", "BDT — Bangladeshi Taka": "BDT", "CAD — Canadian Dollar": "CAD",
+    "AUD — Australian Dollar": "AUD", "JPY — Japanese Yen": "JPY", "CNY — Chinese Yuan": "CNY",
+    "TRY — Turkish Lira": "TRY", "MYR — Malaysian Ringgit": "MYR", "SGD — Singapore Dollar": "SGD",
+    "ZAR — South African Rand": "ZAR",
+}
+COUNTRIES = [
+    "Pakistan", "United States", "United Kingdom", "United Arab Emirates", "Saudi Arabia", "India",
+    "Canada", "Australia", "Germany", "France", "Turkey", "Malaysia", "Singapore", "South Africa",
+    "Bangladesh", "Other"
+]
+CATEGORIES = [
+    "Groceries", "Dining Out", "Housing", "Utilities", "Transport", "Education", "Healthcare",
+    "Shopping", "Entertainment", "Personal Care", "Savings", "Debt Payment", "Other"
+]
+COLUMNS = ["id", "date", "merchant", "description", "category", "amount", "currency", "source"]
+DISPLAY_COLUMNS = ["date", "merchant", "description", "category", "amount", "currency", "source"]
+ESSENTIAL_CATEGORIES = {"Housing", "Utilities", "Transport", "Education", "Healthcare", "Debt Payment", "Groceries"}
+DISCRETIONARY_CATEGORIES = {"Dining Out", "Shopping", "Entertainment", "Personal Care"}
+
+st.set_page_config(page_title=APP_NAME, page_icon="💸", layout="wide")
+
+
+def safe_float(value, default=0.0):
+    try:
+        if pd.isna(value):
+            return default
+        return float(str(value).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def clean_text(value):
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def detect_category(text):
+    t = clean_text(text).lower()
+    rules = {
+        "Groceries": ["grocery", "supermarket", "mart", "rice", "flour", "atta", "soap", "shampoo", "milk", "bread", "vegetable", "fruit", "eggs", "meat", "chicken", "oil", "masala", "detergent"],
+        "Dining Out": ["restaurant", "cafe", "coffee", "pizza", "burger", "foodpanda", "takeaway", "dine", "hotel food", "bakery", "kfc", "mcdonald", "domino"],
+        "Housing": ["rent", "maintenance", "property", "house"],
+        "Utilities": ["electricity", "k-electric", "water bill", "gas bill", "internet", "stormfiber", "mobile bill", "phone bill", "utility"],
+        "Transport": ["fuel", "petrol", "diesel", "uber", "careem", "bykea", "bus", "train", "parking", "toll", "rickshaw", "transport"],
+        "Education": ["school", "tuition", "academy", "university", "college", "fee", "books", "course"],
+        "Healthcare": ["pharmacy", "hospital", "doctor", "clinic", "medicine", "medical", "lab test"],
+        "Shopping": ["clothing", "shirt", "shoes", "electronics", "daraz", "laptop", "phone", "purchase"],
+        "Entertainment": ["cinema", "movie", "netflix", "game", "concert", "subscription"],
+        "Personal Care": ["salon", "barber", "cosmetic", "skincare", "toothpaste", "deodorant"],
+        "Debt Payment": ["loan", "credit card payment", "installment", "debt"],
+    }
+    for category, words in rules.items():
+        if any(word in t for word in words):
+            return category
+    return "Other"
+
+
+def preprocess_receipt(image):
+    """Create several OCR-friendly versions: grayscale, enlarged, contrast and thresholded."""
+    img = Image.open(image).convert("RGB")
+    # Receipts often contain small text; 2x upscaling helps Tesseract.
+    scale = 2.5 if max(img.size) < 2400 else 1.5
+    img = img.resize((int(img.width * scale), int(img.height * scale)), Image.Resampling.LANCZOS)
+    gray = ImageOps.grayscale(img)
+    gray = ImageEnhance.Contrast(gray).enhance(1.8)
+    gray = gray.filter(ImageFilter.SHARPEN)
+    threshold = gray.point(lambda p: 255 if p > 175 else 0)
+    return [gray, threshold]
+
+
+def extract_receipt(image):
+    if not OCR_AVAILABLE:
+        return "", "OCR package is unavailable in this deployment."
+    try:
+        versions = preprocess_receipt(image)
+        results = []
+        for version in versions:
+            for psm in (6, 4, 11, 12):
+                text = pytesseract.image_to_string(version, config=f"--psm {psm}")
+                if text and text.strip():
+                    results.append(text)
+        if not results:
+            return "", "No readable text found. Try a sharper, well-lit image with the whole receipt visible."
+        # Prefer the longest result because it usually preserves more receipt lines.
+        best = max(results, key=lambda x: len(x.strip()))
+        return best, None
+    except Exception as exc:
+        return "", f"Could not read this image ({type(exc).__name__}). You can still enter the expense manually."
+
+
+def normalize_ocr_line(line):
+    # Common OCR substitutions in numeric fields.
+    line = line.replace("O", "0").replace("o", "0") if re.search(r"(?:total|amount|paid|balance)", line, re.I) else line
+    return clean_text(line)
+
+
+def parse_receipt_items(text):
+    """Best-effort multi-item receipt parser. It never saves automatically; every row is reviewed first."""
+    lines = [normalize_ocr_line(x) for x in (text or "").splitlines() if clean_text(x)]
+    merchant = ""
+    for line in lines[:10]:
+        if not re.search(r"receipt|invoice|tax|date|time|cashier|order|total|amount|phone|tel|www|http", line, re.I) and re.search(r"[A-Za-z]{3,}", line):
+            merchant = line[:80]
+            break
+    if not merchant and lines:
+        merchant = lines[0][:80]
+
+    amount_pattern = r"(?<!\w)(?:PKR|Rs\.?|USD|\$|EUR|€|GBP|£|AED|SAR|INR)?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)(?!\w)"
+    ignore = r"grand\s*total|net\s*total|total\s*amount|amount\s*due|balance\s*due|subtotal|tax|vat|gst|sales\s*tax|discount|change|cash|tender|paid|payment|visa|master|debit|credit|invoice|receipt|date|time|cashier|order|phone|tel|www|http"
+    total_labels = r"grand\s*total|net\s*total|total\s*amount|amount\s*due|balance\s*due|^total\b"
+    items=[]; receipt_total=None
+    for i,line in enumerate(lines):
+        nums=list(re.finditer(amount_pattern,line,re.I))
+        if not nums: continue
+        values=[safe_float(m.group(1)) for m in nums]
+        values=[v for v in values if v>0]
+        if not values: continue
+        if re.search(total_labels,line,re.I):
+            receipt_total=values[-1]
+            continue
+        if re.search(ignore,line,re.I):
+            continue
+        # Remove the final monetary value from the description. For common layouts
+        # such as "Milk 2 x 320 640", also remove the preceding price field.
+        amount=values[-1]
+        desc=line[:nums[-1].start()].strip(" -:|")
+        if len(nums)>=2:
+            middle=line[nums[-2].start():nums[-1].start()].strip(" -:|xX×")
+            if middle and re.fullmatch(r"[0-9]+(?:\.[0-9]+)?",middle):
+                desc=desc
+        if not desc or len(desc)<2: continue
+        if not re.search(r"[A-Za-z]{2,}",desc): continue
+        # Avoid obvious header/metadata rows and numeric product codes.
+        if re.fullmatch(r"[A-Za-z]{1,4}\s*[-#]?\s*\d+",desc): continue
+        quantity=1.0
+        qmatch=re.search(r"(?:^|\s)(?:x|×)\s*(\d+(?:\.\d+)?)\s*$",desc,re.I)
+        if qmatch:
+            quantity=safe_float(qmatch.group(1),1.0); desc=desc[:qmatch.start()].strip()
+        else:
+            qmatch=re.search(r"^\s*(\d+(?:\.\d+)?)\s+(?:x|×)\s+(.+)$",desc,re.I)
+            if qmatch:
+                quantity=safe_float(qmatch.group(1),1.0); desc=qmatch.group(2).strip()
+        if desc:
+            items.append({"description":desc[:120],"quantity":quantity,"amount":amount,"category":detect_category(f"{merchant} {desc}"),"source_line":line})
+
+    # De-duplicate OCR repeats while preserving separate genuine line items.
+    unique=[]; seen=set()
+    for item in items:
+        key=(re.sub(r"\s+"," ",item["description"].lower()), round(item["amount"],2), round(item["quantity"],2))
+        if key not in seen:
+            seen.add(key); unique.append(item)
+    items=unique
+    item_sum=sum(i["amount"] for i in items)
+    difference=(item_sum-receipt_total) if receipt_total is not None else None
+    tolerance=max(5.0,(receipt_total or item_sum or 0)*0.03)
+    if not items: confidence="Low"
+    elif receipt_total is not None and abs(difference)<=tolerance: confidence="High"
+    elif len(items)>=2: confidence="Medium"
+    else: confidence="Medium"
+    return {"merchant":merchant,"items":items,"receipt_total":receipt_total,"item_sum":item_sum,"difference":difference,"confidence":confidence}
+
+
+def parse_receipt(text):
+    """Backward-compatible single-total helper."""
+    parsed=parse_receipt_items(text)
+    if parsed["receipt_total"] is not None:
+        return parsed["merchant"], parsed["receipt_total"]
+    return parsed["merchant"], parsed["item_sum"]
+
+
+def detect_country():
+    try:
+        r = requests.get("https://ipapi.co/json/", timeout=3)
+        if r.ok:
+            data = r.json()
+            return data.get("country_name"), data.get("currency")
+    except Exception:
+        pass
+    return None, None
+
+
+def try_llm_advice(prompt):
+    """Groq OpenAI-compatible chat call with current model defaults and visible diagnostics."""
+    try:
+        api_key = st.secrets.get("GROQ_API_KEY", "")
+        model = st.secrets.get("GROQ_MODEL", "openai/gpt-oss-20b")
+        if not api_key:
+            return None, "GROQ_API_KEY is not configured in Streamlit Secrets."
+        response = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": "You are PennyPilot AI, a cautious personal finance education assistant. Use ONLY the supplied user data. Give concrete observations tied to their actual spending. Do not invent transactions. Do not guarantee returns or recommend specific securities. Do not provide buy/sell instructions. Mention when the dataset is incomplete. Format with a short headline, 3 specific observations, 3 practical next steps, and one caution."},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.2,
+                "max_tokens": 700,
+            },
+            timeout=20,
+        )
+        if not response.ok:
+            try:
+                detail = response.json().get("error", {}).get("message", response.text[:300])
+            except Exception:
+                detail = response.text[:300]
+            return None, f"Groq request failed ({response.status_code}): {detail}"
+        data = response.json()
+        return data["choices"][0]["message"]["content"], None
+    except Exception as exc:
+        return None, f"AI request could not be completed: {type(exc).__name__}: {exc}"
+
+
+def init_state():
+    if "transactions" not in st.session_state:
+        st.session_state.transactions = pd.DataFrame(columns=COLUMNS)
+    else:
+        # Upgrade older sessions that do not have IDs.
+        tx = st.session_state.transactions.copy()
+        for c in COLUMNS:
+            if c not in tx.columns:
+                tx[c] = str(uuid.uuid4()) if c == "id" else ""
+        if tx["id"].isna().any() or (tx["id"].astype(str).str.len() < 5).any():
+            tx["id"] = [str(uuid.uuid4()) for _ in range(len(tx))]
+        st.session_state.transactions = tx[COLUMNS]
+    if "goals" not in st.session_state:
+        st.session_state.goals = []
+    if "budget" not in st.session_state:
+        st.session_state.budget = 100000.0
+    if "currency" not in st.session_state:
+        st.session_state.currency = "PKR"
+    if "country" not in st.session_state:
+        country, _ = detect_country()
+        st.session_state.country = country if country in COUNTRIES else "Pakistan"
+
+
+def add_transaction(tx):
+    row = {c: tx.get(c, "") for c in COLUMNS}
+    row["id"] = row["id"] or str(uuid.uuid4())
+    row["amount"] = safe_float(row["amount"])
+    if row["amount"] <= 0:
+        raise ValueError("Amount must be greater than zero.")
+    row["date"] = pd.to_datetime(row["date"], errors="coerce").date().isoformat() if pd.notna(pd.to_datetime(row["date"], errors="coerce")) else date.today().isoformat()
+    row["merchant"] = clean_text(row["merchant"]) or "Not specified"
+    row["description"] = clean_text(row["description"])
+    row["category"] = row["category"] if row["category"] in CATEGORIES else detect_category(f"{row['merchant']} {row['description']}")
+    row["currency"] = row["currency"] if row["currency"] in CURRENCIES.values() else st.session_state.currency
+    row["source"] = clean_text(row["source"]) or "Manual"
+    st.session_state.transactions = pd.concat([st.session_state.transactions, pd.DataFrame([row])], ignore_index=True)[COLUMNS]
+
+
+def money(value, currency):
+    return f"{currency} {value:,.2f}"
+
+
+def visible_df():
+    df = st.session_state.transactions.copy()
+    if df.empty:
+        return df
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0)
+    return df[df["currency"] == st.session_state.currency].copy()
+
+
+
+def analyze_spending_trends(df):
+    """Return month/category trend facts from recorded transactions."""
+    if df.empty:
+        return {
+            "monthly": pd.DataFrame(columns=["month", "amount"]),
+            "category_monthly": pd.DataFrame(),
+            "current_month": 0.0,
+            "previous_month": 0.0,
+            "change_pct": None,
+            "trend_direction": "No data",
+        }
+    work = df.copy()
+    work["date"] = pd.to_datetime(work["date"], errors="coerce")
+    work["amount"] = pd.to_numeric(work["amount"], errors="coerce").fillna(0)
+    work = work.dropna(subset=["date"])
+    if work.empty:
+        return {
+            "monthly": pd.DataFrame(columns=["month", "amount"]),
+            "category_monthly": pd.DataFrame(),
+            "current_month": 0.0,
+            "previous_month": 0.0,
+            "change_pct": None,
+            "trend_direction": "No data",
+        }
+    work["month"] = work["date"].dt.to_period("M").astype(str)
+    monthly = work.groupby("month", as_index=False)["amount"].sum().sort_values("month")
+    current_month = float(monthly.iloc[-1]["amount"])
+    previous_month = float(monthly.iloc[-2]["amount"]) if len(monthly) >= 2 else 0.0
+    change_pct = ((current_month - previous_month) / previous_month) if previous_month > 0 else None
+    if change_pct is None:
+        direction = "First recorded month"
+    elif change_pct > 0.10:
+        direction = "Increasing"
+    elif change_pct < -0.10:
+        direction = "Decreasing"
+    else:
+        direction = "Stable"
+    category_monthly = work.pivot_table(
+        index="month", columns="category", values="amount", aggfunc="sum", fill_value=0
+    ).reset_index()
+    return {
+        "monthly": monthly,
+        "category_monthly": category_monthly,
+        "current_month": current_month,
+        "previous_month": previous_month,
+        "change_pct": change_pct,
+        "trend_direction": direction,
+    }
+
+
+def detect_recurring_expenses(df):
+    """Heuristic recurring-expense detector based on merchant/category and repeated amounts."""
+    if df.empty:
+        return []
+    work = df.copy()
+    work["date"] = pd.to_datetime(work["date"], errors="coerce")
+    work["amount"] = pd.to_numeric(work["amount"], errors="coerce").fillna(0)
+    work["merchant_key"] = (
+        work["merchant"].fillna("").astype(str).str.lower()
+        .str.replace(r"[^a-z0-9]+", " ", regex=True).str.strip()
+    )
+    work = work.dropna(subset=["date"])
+    if work.empty:
+        return []
+
+    results = []
+    for key, group in work.groupby(["merchant_key", "category"], dropna=False):
+        if not key[0] or len(group) < 2:
+            continue
+        group = group.sort_values("date")
+        dates = group["date"].tolist()
+        gaps = [(dates[i] - dates[i-1]).days for i in range(1, len(dates))]
+        if not gaps:
+            continue
+        median_gap = float(pd.Series(gaps).median())
+        amount_median = float(group["amount"].median())
+        amount_variation = (
+            float(group["amount"].max() - group["amount"].min()) / amount_median
+            if amount_median > 0 else 1.0
+        )
+        monthly_like = 20 <= median_gap <= 45
+        weekly_like = 5 <= median_gap <= 9
+        repeated_amount = amount_variation <= 0.15
+        if (monthly_like or weekly_like) and (repeated_amount or len(group) >= 3):
+            label = str(group.iloc[-1]["merchant"])
+            frequency = "monthly" if monthly_like else "weekly"
+            results.append({
+                "merchant": label,
+                "category": str(group.iloc[-1]["category"]),
+                "frequency": frequency,
+                "occurrences": len(group),
+                "median_gap_days": round(median_gap, 1),
+                "typical_amount": amount_median,
+                "last_date": dates[-1].date().isoformat(),
+            })
+    results.sort(key=lambda x: (x["typical_amount"] * x["occurrences"]), reverse=True)
+    return results[:8]
+
+
+def optimize_goals(goals, discretionary_total, top_discretionary_category, currency):
+    """Show simple contribution scenarios without assuming the user will cut spending."""
+    options = []
+    for goal in goals:
+        if goal.get("currency") != currency:
+            continue
+        target = float(goal.get("target", 0))
+        saved = float(goal.get("saved", 0))
+        monthly = float(goal.get("monthly", 0))
+        gap = max(target - saved, 0)
+        base_months = math.ceil(gap / monthly) if gap and monthly > 0 else 0
+        if not gap:
+            options.append({
+                "name": str(goal.get("name", "Goal")), "gap": 0,
+                "base_months": 0, "scenarios": []
+            })
+            continue
+        scenario_savings = []
+        if discretionary_total > 0:
+            for pct in (0.10, 0.20, 0.30):
+                extra = discretionary_total * pct
+                new_monthly = monthly + extra
+                new_months = math.ceil(gap / new_monthly) if new_monthly > 0 else 0
+                scenario_savings.append({
+                    "label": f"{int(pct*100)}% discretionary reduction",
+                    "extra": extra, "new_monthly": new_monthly,
+                    "months": new_months,
+                    "months_saved": max(base_months - new_months, 0),
+                })
+        options.append({
+            "name": str(goal.get("name", "Goal")),
+            "gap": gap, "base_months": base_months,
+            "current_monthly": monthly,
+            "scenarios": scenario_savings,
+            "focus_category": top_discretionary_category or "discretionary spending",
+        })
+    return options
+
+
+def build_financial_agent(budget, df, currency, goals):
+    """Calculate financial facts deterministically; the optional LLM only explains them."""
+    spent = float(df["amount"].sum()) if not df.empty else 0.0
+    remaining = budget - spent
+    ratio = spent / budget if budget > 0 else 0.0
+    today = date.today()
+    month_days = pd.Timestamp(today).days_in_month
+    day_number = today.day
+    projected = spent / day_number * month_days if day_number and spent else 0.0
+    trend = analyze_spending_trends(df)
+    recurring = detect_recurring_expenses(df)
+
+    context = {
+        "spent": spent, "remaining": remaining, "ratio": ratio,
+        "projected": projected, "transactions": len(df),
+        "top_category": "", "top_category_amount": 0.0,
+        "top_category_pct": 0.0, "discretionary": 0.0,
+        "essential": 0.0, "category_totals": {},
+        "largest_transaction": None, "goal_analysis": [],
+        "recommended_actions": [], "budget_status": "No data",
+        "trend": trend, "recurring_expenses": recurring,
+        "goal_optimization": []
+    }
+    if df.empty:
+        return [], context
+
+    cats = df.groupby("category")["amount"].sum().sort_values(ascending=False)
+    discretionary = float(df[df["category"].isin(DISCRETIONARY_CATEGORIES)]["amount"].sum())
+    essential = float(df[df["category"].isin(ESSENTIAL_CATEGORIES)]["amount"].sum())
+    top_cat, top_val = str(cats.index[0]), float(cats.iloc[0])
+    largest = df.nlargest(1, "amount").iloc[0]
+
+    if ratio >= 1:
+        status = "Over budget"
+    elif projected > budget and day_number < month_days:
+        status = "At risk"
+    elif ratio >= 0.85:
+        status = "Watch"
+    else:
+        status = "On track"
+
+    context.update({
+        "top_category": top_cat, "top_category_amount": top_val,
+        "top_category_pct": top_val / spent if spent else 0,
+        "discretionary": discretionary, "essential": essential,
+        "category_totals": {str(k): float(v) for k, v in cats.items()},
+        "budget_status": status,
+        "largest_transaction": {
+            "merchant": str(largest["merchant"]),
+            "amount": float(largest["amount"]),
+            "category": str(largest["category"]),
+            "date": str(largest["date"])
+        }
+    })
+
+    # Connect discretionary spending to savings goals.
+    for goal in goals:
+        if goal.get("currency") != currency:
+            continue
+        target = float(goal.get("target", 0))
+        saved = float(goal.get("saved", 0))
+        monthly = float(goal.get("monthly", 0))
+        gap = max(target - saved, 0)
+        current_months = math.ceil(gap / monthly) if gap and monthly > 0 else 0
+        opportunities = []
+        for category in DISCRETIONARY_CATEGORIES:
+            value = float(cats.get(category, 0))
+            if value > 0:
+                saving = value * 0.20
+                new_monthly = monthly + saving
+                new_months = math.ceil(gap / new_monthly) if gap and new_monthly > 0 else 0
+                opportunities.append({
+                    "category": category,
+                    "potential_saving": saving,
+                    "new_monthly": new_monthly,
+                    "new_months": new_months,
+                    "months_saved": max(current_months - new_months, 0)
+                })
+        opportunities.sort(key=lambda x: x["potential_saving"], reverse=True)
+        context["goal_analysis"].append({
+            "name": str(goal.get("name", "Goal")),
+            "gap": gap, "monthly": monthly,
+            "current_months": current_months,
+            "opportunities": opportunities[:3]
+        })
+
+    actions = []
+    if ratio >= 1:
+        actions.append(f"Reduce discretionary spending until the recorded {money(abs(remaining), currency)} budget gap is recovered.")
+    elif projected > budget and day_number < month_days:
+        actions.append(f"Your current pace points to about {money(projected, currency)} by month-end; protect the remaining {money(max(remaining, 0), currency)}.")
+    elif ratio >= 0.85:
+        actions.append(f"Keep the remaining {money(max(remaining, 0), currency)} for essential or already-planned expenses.")
+    else:
+        actions.append(f"Keep at least {money(max(remaining, 0), currency)} uncommitted until the end of the budget period.")
+
+    discretionary_ranked = sorted(
+        [(c, float(cats.get(c, 0))) for c in DISCRETIONARY_CATEGORIES if float(cats.get(c, 0)) > 0],
+        key=lambda x: x[1], reverse=True
+    )
+    top_discretionary = discretionary_ranked[0][0] if discretionary_ranked else ""
+    context["goal_optimization"] = optimize_goals(
+        goals, discretionary, top_discretionary, currency
+    )
+    if discretionary_ranked:
+        c, value = discretionary_ranked[0]
+        actions.append(f"Review {c}: a 20% reduction would free about {money(value * 0.20, currency)} based on recorded spending.")
+    else:
+        actions.append("Most recorded spending is essential, so the coach is avoiding arbitrary cuts to essential categories.")
+
+    if recurring:
+        r = recurring[0]
+        actions.append(
+            f"Watch {r['merchant']}: PennyPilot detected a possible {r['frequency']} pattern "
+            f"around {money(r['typical_amount'], currency)} per occurrence. Verify it is genuinely recurring."
+        )
+    elif trend["change_pct"] is not None and trend["change_pct"] > 0.10:
+        actions.append("Recorded spending increased by more than 10% versus the previous recorded month; review which categories changed.")
+
+    best = None
+    for goal in context["goal_analysis"]:
+        for opp in goal["opportunities"]:
+            if best is None or opp["months_saved"] > best[1]["months_saved"]:
+                best = (goal, opp)
+    if best and best[1]["potential_saving"] > 0:
+        goal, opp = best
+        actions.append(f"For {goal['name']}, redirecting about {money(opp['potential_saving'], currency)}/month from {opp['category']} could shorten the simple goal estimate from {goal['current_months']} to {opp['new_months']} month(s).")
+    context["recommended_actions"] = actions[:3]
+
+    lines = [
+        f"You have recorded {money(spent, currency)} against a {money(budget, currency)} monthly budget ({ratio:.0%} recorded).",
+        f"{top_cat} is your largest recorded category at {money(top_val, currency)} ({top_val / spent:.0%} of recorded spending).",
+        f"At the current pace, recorded spending would be roughly {money(projected, currency)} by month-end; this is a pace estimate, not a guaranteed forecast.",
+        f"Your largest recorded transaction is {money(float(largest['amount']), currency)} at {largest['merchant']} ({largest['category']})."
+    ]
+    if discretionary:
+        lines.append(f"Recorded discretionary spending is {money(discretionary, currency)} ({discretionary / spent:.0%} of spending).")
+    return lines, context
+
+# Compatibility for any older reference.
+build_personal_coach = build_financial_agent
+
+
+def investment_education(country, currency, remaining):
+    return (
+        f"Country selected: {country}. Currency: {currency}. These are educational considerations, not personalized investment instructions.\n\n"
+        "1. Emergency reserve: consider building accessible savings for unexpected expenses before taking market risk.\n"
+        "2. Stocks/funds: prices can fall; learn about diversification, fees, regulation, and time horizon. Avoid investing money needed soon.\n"
+        "3. Gold: prices fluctuate and spreads/storage can affect returns; it does not generate interest or dividends.\n"
+        "4. Crypto: highly volatile and may involve fraud, custody, platform, and regulatory risks.\n"
+        "5. Local rules: check the relevant country's regulator and tax treatment before acting.\n\n"
+        f"Recorded budget remaining this month: {money(max(remaining, 0), currency)}. This may be incomplete if expenses have not been recorded."
+    )
+
+
+def normalize_import_columns(raw):
+    aliases = {
+        "date": ["date", "transaction date", "expense date", "day"],
+        "merchant": ["merchant", "payee", "vendor", "store", "description merchant"],
+        "description": ["description", "details", "item", "note", "notes"],
+        "category": ["category", "type", "expense category"],
+        "amount": ["amount", "expense", "value", "total", "price", "cost"],
+        "currency": ["currency", "curr", "ccy"],
+        "source": ["source", "entry source"],
+    }
+    rename = {}
+    normalized = {re.sub(r"[^a-z0-9]+", " ", str(c).lower()).strip(): c for c in raw.columns}
+    for target, names in aliases.items():
+        for name in names:
+            key = re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
+            if key in normalized:
+                rename[normalized[key]] = target
+                break
+    df = raw.rename(columns=rename).copy()
+    for c in COLUMNS[1:]:
+        if c not in df.columns:
+            df[c] = ""
+    if "currency" not in rename.values():
+        df["currency"] = st.session_state.currency
+    if "source" not in rename.values():
+        df["source"] = "Spreadsheet import"
+    if "category" not in rename.values():
+        df["category"] = [detect_category(f"{m} {d}") for m, d in zip(df["merchant"], df["description"])]
+    return df[[c for c in COLUMNS if c != "id"]]
+
+
+def prepare_import(raw):
+    df = normalize_import_columns(raw)
+    df["amount"] = pd.to_numeric(df["amount"].astype(str).str.replace(",", "", regex=False).str.extract(r"(-?\d+(?:\.\d+)?)")[0], errors="coerce")
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+    df["merchant"] = df["merchant"].fillna("").map(clean_text)
+    df["description"] = df["description"].fillna("").map(clean_text)
+    df["currency"] = df["currency"].fillna(st.session_state.currency).astype(str).str.upper().str.strip()
+    df["category"] = df.apply(lambda r: r["category"] if r["category"] in CATEGORIES else detect_category(f"{r['merchant']} {r['description']}"), axis=1)
+    df["source"] = df["source"].fillna("Spreadsheet import").astype(str)
+    return df
+
+
+init_state()
+st.title("💸 PennyPilot AI")
+st.caption("A privacy-conscious personal budget, receipt and savings-goal assistant")
+st.info("Hackathon MVP: records are stored in this active app session and may be lost when the session resets. Do not enter bank passwords, card numbers, or other sensitive credentials. This is an educational tool, not regulated financial advice.")
+
+with st.sidebar:
+    st.header("Your financial profile")
+    selected_label = st.selectbox("Monthly budget currency", list(CURRENCIES.keys()), index=list(CURRENCIES.values()).index(st.session_state.currency) if st.session_state.currency in CURRENCIES.values() else 0)
+    st.session_state.currency = CURRENCIES[selected_label]
+    st.session_state.budget = st.number_input("Approx. monthly budget", min_value=0.0, value=float(st.session_state.budget), step=1000.0, format="%.2f")
+    detected = st.session_state.get("country")
+    st.caption(f"Best-effort country detection: {detected or 'not detected'}")
+    country_index = COUNTRIES.index(detected) if detected in COUNTRIES else 0
+    st.session_state.country = st.selectbox("Country (edit if incorrect)", COUNTRIES, index=country_index)
+    st.caption("Country detection uses a no-key IP lookup when available. It can be inaccurate; your selection takes priority.")
+
+df = visible_df()
+total_spent = float(df["amount"].sum()) if not df.empty else 0.0
+remaining = st.session_state.budget - total_spent
+
+tabs = st.tabs(["📊 Dashboard", "🧾 Add expense", "📥 Import expenses", "🎯 Savings goals", "🧠 Money coach", "📤 Export"])
+
+with tabs[0]:
+    st.subheader("Monthly overview")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Monthly budget", money(st.session_state.budget, st.session_state.currency))
+    c2.metric("Recorded spending", money(total_spent, st.session_state.currency))
+    c3.metric("Budget remaining", money(remaining, st.session_state.currency), delta="Over budget" if remaining < 0 else "Available")
+    if st.session_state.budget > 0:
+        st.progress(min(max(total_spent / st.session_state.budget, 0.0), 1.0), text=f"{total_spent / st.session_state.budget:.0%} of budget recorded")
+    if df.empty:
+        st.write("No expenses recorded in this currency yet. Add one manually, upload a receipt, or import a CSV/Excel file.")
+    else:
+        left, right = st.columns([1, 1])
+        category_totals = df.groupby("category", as_index=False)["amount"].sum().sort_values("amount", ascending=False)
+        with left:
+            st.markdown("**Spending by category**")
+            fig = px.pie(category_totals, values="amount", names="category", hole=0.35)
+            st.plotly_chart(fig, use_container_width=True)
+        with right:
+            st.markdown("**Recent transactions**")
+            st.dataframe(df.sort_values("date", ascending=False)[DISPLAY_COLUMNS], use_container_width=True, hide_index=True)
+
+        trend_info = analyze_spending_trends(df)
+        if len(trend_info["monthly"]) >= 2:
+            st.markdown("**Spending trend**")
+            tc1, tc2, tc3 = st.columns(3)
+            tc1.metric("Latest recorded month", money(trend_info["current_month"], st.session_state.currency))
+            tc2.metric("Previous recorded month", money(trend_info["previous_month"], st.session_state.currency))
+            change = trend_info["change_pct"]
+            tc3.metric("Month-over-month change", "N/A" if change is None else f"{change:+.0%}")
+            trend_fig = px.line(trend_info["monthly"], x="month", y="amount", markers=True, title="Recorded spending over time")
+            st.plotly_chart(trend_fig, use_container_width=True)
+
+    st.divider()
+    st.subheader("Remove an expense")
+    all_tx = st.session_state.transactions.copy()
+    if all_tx.empty:
+        st.caption("There are no expenses to remove.")
+    else:
+        choices = {}
+        for _, row in all_tx.iterrows():
+            label = f"{row['date']} · {row['merchant']} · {row['currency']} {safe_float(row['amount']):,.2f} · {row['category']}"
+            choices[label] = row["id"]
+        selected = st.multiselect("Select one or more expenses to remove", list(choices.keys()), key="delete_expenses")
+        if selected and st.button("Delete selected expense(s)", type="secondary"):
+            ids = {choices[x] for x in selected}
+            st.session_state.transactions = st.session_state.transactions[~st.session_state.transactions["id"].isin(ids)].reset_index(drop=True)
+            st.session_state.pop("delete_expenses", None)
+            st.success(f"Deleted {len(ids)} expense(s).")
+            st.rerun()
+    st.caption("Deleting an expense removes it from the current session and from future CSV exports.")
+
+with tabs[1]:
+    st.subheader("Record an expense")
+    method = st.radio("Choose entry method", ["Manual entry", "Upload receipt image", "Take receipt photo"], horizontal=True)
+    if method == "Manual entry":
+        with st.form("manual_expense_form", clear_on_submit=True):
+            d = st.date_input("Date", value=date.today())
+            merchant = st.text_input("Merchant / payee", placeholder="e.g., local supermarket")
+            description = st.text_input("What did you buy?", placeholder="e.g., shampoo, rice and flour")
+            amount = st.number_input(f"Amount ({st.session_state.currency})", min_value=0.0, step=100.0)
+            suggested = detect_category(f"{merchant} {description}")
+            category = st.selectbox("Category", CATEGORIES, index=CATEGORIES.index(suggested))
+            submitted = st.form_submit_button("Save expense", type="primary")
+            if submitted:
+                try:
+                    add_transaction({"date": d.isoformat(), "merchant": merchant, "description": description, "category": category, "amount": amount, "currency": st.session_state.currency, "source": "Manual"})
+                    st.success("Expense saved for this session.")
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
+    else:
+        uploaded = st.camera_input("Take a receipt photo") if method == "Take receipt photo" else st.file_uploader(
+            "Upload a receipt or screenshot", type=["png", "jpg", "jpeg", "webp"], key="receipt_image")
+        if uploaded:
+            st.image(uploaded, caption="Receipt image", use_container_width=True)
+            if st.button("Extract receipt details", type="primary"):
+                text, error = extract_receipt(uploaded)
+                st.session_state["ocr_text"] = text
+                st.session_state["ocr_error"] = error
+                st.session_state["ocr_parsed"] = parse_receipt_items(text) if text else {}
+            if st.session_state.get("ocr_error"):
+                st.warning(st.session_state["ocr_error"])
+            if st.session_state.get("ocr_text"):
+                st.markdown("**OCR result — review before saving**")
+                st.text_area("Extracted receipt text", value=st.session_state["ocr_text"], height=180, key="ocr_review")
+                parsed=st.session_state.get("ocr_parsed") or parse_receipt_items(st.session_state["ocr_text"])
+                items=parsed.get("items",[])
+                if items:
+                    st.success(f"Detected {len(items)} expense item(s). Nothing will be saved until you review and confirm the table below.")
+                    c1,c2,c3=st.columns(3)
+                    c1.metric("Detected items",len(items))
+                    c2.metric("Item total",money(parsed.get("item_sum",0),st.session_state.currency))
+                    total=parsed.get("receipt_total")
+                    c3.metric("Receipt total",money(total,st.session_state.currency) if total is not None else "Not detected")
+                    if total is not None:
+                        diff=parsed.get("difference",0)
+                        if abs(diff)>max(5,total*0.03):
+                            st.warning(f"The detected item total differs from the receipt total by {money(abs(diff),st.session_state.currency)}. Check the rows for discounts, tax, missing lines, or OCR errors.")
+                        else:
+                            st.info("The detected item total is close to the receipt total. Still verify the rows before saving.")
+                    st.caption(f"Parser confidence: {parsed.get('confidence','Low')} · Tax, discounts, subtotal, payment and change lines are excluded when recognized.")
+                    rows=[]
+                    for item in items:
+                        rows.append({"Include":True,"Date":date.today(),"Merchant":parsed.get("merchant") or "Not specified","Description":item["description"],"Category":item["category"],"Amount":float(item["amount"]),"Currency":st.session_state.currency})
+                    review=pd.DataFrame(rows)
+                    edited=st.data_editor(review,use_container_width=True,hide_index=True,num_rows="dynamic",column_config={
+                        "Include":st.column_config.CheckboxColumn("Save?",default=True),
+                        "Date":st.column_config.DateColumn("Date"),
+                        "Amount":st.column_config.NumberColumn("Amount",min_value=0.01,format="%.2f"),
+                        "Category":st.column_config.SelectboxColumn("Category",options=CATEGORIES),
+                        "Currency":st.column_config.SelectboxColumn("Currency",options=list(CURRENCIES.values())),
+                    },key="ocr_items_editor")
+                    if st.button("Save verified receipt items",type="primary",key="save_ocr_items"):
+                        saved=0; errors=[]
+                        for _,row in edited.iterrows():
+                            if not bool(row.get("Include",True)): continue
+                            amount=safe_float(row.get("Amount"))
+                            if amount<=0: errors.append(f"Skipped {row.get('Description','item')}: amount must be greater than zero."); continue
+                            try:
+                                row_date=row.get("Date",date.today())
+                                if hasattr(row_date,"date"): row_date=row_date.date()
+                                add_transaction({"date":pd.to_datetime(row_date).date().isoformat(),"merchant":str(row.get("Merchant") or "Not specified"),"description":str(row.get("Description") or "Receipt item"),"category":str(row.get("Category") or "Other"),"amount":amount,"currency":str(row.get("Currency") or st.session_state.currency),"source":"Receipt OCR"})
+                                saved+=1
+                            except Exception as exc: errors.append(str(exc))
+                        if errors:
+                            st.warning("; ".join(errors[:5]))
+                        if saved:
+                            st.success(f"Saved {saved} receipt item(s) as separate expenses.")
+                            for key in ["ocr_text","ocr_error","ocr_parsed","ocr_items_editor"]: st.session_state.pop(key,None)
+                            st.rerun()
+                else:
+                    st.warning("No reliable individual expense lines were detected. You can still enter the receipt manually using the total below.")
+                    fallback_total=safe_float(parsed.get("receipt_total",0))
+                    with st.form("receipt_fallback_form"):
+                        merchant=st.text_input("Merchant / payee",value=parsed.get("merchant","") or "Not specified")
+                        description=st.text_input("Purchase description",value="Receipt purchase")
+                        amount=st.number_input(f"Total amount ({st.session_state.currency})",min_value=0.0,value=fallback_total,step=100.0)
+                        category=st.selectbox("Category",CATEGORIES,index=CATEGORIES.index(detect_category(f"{merchant} {description}")))
+                        d=st.date_input("Expense date",value=date.today(),key="receipt_fallback_date")
+                        if st.form_submit_button("Save verified expense",type="primary"):
+                            try:
+                                add_transaction({"date":d.isoformat(),"merchant":merchant or "Not specified","description":description,"category":category,"amount":amount,"currency":st.session_state.currency,"source":"Receipt OCR"})
+                                for key in ["ocr_text","ocr_error","ocr_parsed"]: st.session_state.pop(key,None)
+                                st.success("Verified expense saved."); st.rerun()
+                            except ValueError as exc: st.error(str(exc))
+                st.caption("OCR is best-effort. Always verify item names, quantities, prices and totals before saving.")
+
+with tabs[2]:
+    st.subheader("Add multiple expenses at once")
+    st.write("Upload a CSV or Excel spreadsheet. PennyPilot will map common column names, suggest categories, validate amounts/dates, show a preview, and only add rows after you confirm.")
+    st.info("Recommended columns: Date, Merchant, Description, Category, Amount, Currency. Category and Currency can be omitted; PennyPilot will suggest them/use your selected currency.")
+    files = st.file_uploader(
+        "Upload one or more CSV/Excel files",
+        type=["csv", "xlsx", "xls"],
+        accept_multiple_files=True,
+        key="bulk_expense_file",
+        help="You can select multiple monthly files at once, for example January.csv, February.csv and March.csv."
+    )
+
+    if files:
+        file_signature = tuple(f"{f.name}:{getattr(f, 'size', 0)}" for f in files)
+        if st.session_state.get("bulk_uploaded_signature") != file_signature:
+            st.session_state["bulk_uploaded_signature"] = file_signature
+            st.toast(f"{len(files)} expense sheet(s) uploaded successfully.", icon="✅")
+
+        st.success(f"✅ {len(files)} expense sheet(s) uploaded: {', '.join(f.name for f in files)}")
+
+        imported_parts = []
+        file_errors = []
+        total_rows = 0
+
+        for uploaded_file in files:
+            try:
+                raw = (
+                    pd.read_csv(uploaded_file)
+                    if uploaded_file.name.lower().endswith(".csv")
+                    else pd.read_excel(uploaded_file)
+                )
+                imported_file = prepare_import(raw)
+                imported_file["source"] = imported_file["source"].replace("", pd.NA).fillna("Spreadsheet import")
+                # Keep the original filename visible so users can identify the month/source.
+                imported_file["source"] = imported_file["source"].astype(str).replace("Spreadsheet import", f"Spreadsheet: {uploaded_file.name}")
+                imported_parts.append(imported_file)
+                total_rows += len(imported_file)
+            except Exception as exc:
+                file_errors.append(f"{uploaded_file.name}: {type(exc).__name__}: {exc}")
+
+        for error in file_errors:
+            st.error(f"Could not read {error}")
+
+        if imported_parts:
+            imported = pd.concat(imported_parts, ignore_index=True)
+            invalid = imported[imported["amount"].isna() | (imported["amount"] <= 0) | imported["date"].isna()].copy()
+            unsupported = imported[~imported["currency"].isin(CURRENCIES.values())].copy()
+
+            st.write(f"Total rows detected across uploaded files: **{total_rows}**")
+            if not invalid.empty:
+                st.warning(f"{len(invalid)} row(s) have an invalid/missing date or amount and will not be imported.")
+            if not unsupported.empty:
+                st.warning(f"{len(unsupported)} row(s) use an unsupported currency and will not be imported.")
+
+            valid = imported.drop(index=invalid.index).copy()
+            valid = valid[valid["currency"].isin(CURRENCIES.values())].copy()
+            valid["date"] = valid["date"].astype(str)
+            valid = valid[["date", "merchant", "description", "category", "amount", "currency", "source"]]
+
+            if valid.empty:
+                st.error("No valid rows are available to import. Check the spreadsheet columns and values.")
+            else:
+                st.markdown("**Preview — review all uploaded months before importing**")
+                edited = st.data_editor(
+                    valid,
+                    use_container_width=True,
+                    hide_index=True,
+                    num_rows="dynamic",
+                    key="bulk_preview",
+                    column_config={"amount": st.column_config.NumberColumn("amount", min_value=0.01, format="%.2f")}
+                )
+                if st.button("Import all uploaded expenses", type="primary"):
+                    added = 0
+                    for _, row in edited.iterrows():
+                        try:
+                            add_transaction(row.to_dict())
+                            added += 1
+                        except ValueError:
+                            pass
+                    st.session_state["bulk_import_message"] = f"Successfully imported {added} expense(s) from {len(files)} uploaded sheet(s)."
+                    st.rerun()
+
+    if st.session_state.get("bulk_import_message"):
+        st.success(f"✅ {st.session_state.pop('bulk_import_message')}")
+
+with tabs[3]:
+    st.subheader("Plan a savings goal")
+    st.write("Add a target and PennyPilot estimates a timeline from the monthly contribution you choose.")
+    with st.form("goal_form", clear_on_submit=True):
+        goal_name = st.text_input("Goal", placeholder="e.g., laptop, car, education fund")
+        target = st.number_input(f"Target amount ({st.session_state.currency})", min_value=1.0, value=100000.0, step=5000.0)
+        saved = st.number_input(f"Already saved ({st.session_state.currency})", min_value=0.0, value=0.0, step=1000.0)
+        contribution = st.number_input(f"Planned monthly contribution ({st.session_state.currency})", min_value=0.0, value=5000.0, step=1000.0)
+        goal_submit = st.form_submit_button("Add savings goal", type="primary")
+        if goal_submit:
+            if not goal_name.strip():
+                st.error("Enter a name for your goal.")
+            elif contribution <= 0 and saved < target:
+                st.error("Monthly contribution must be greater than zero.")
+            else:
+                months = math.ceil(max(target - saved, 0) / contribution) if contribution > 0 else 0
+                st.session_state.goals.append({"name": goal_name.strip(), "target": target, "saved": saved, "monthly": contribution, "months": months, "currency": st.session_state.currency})
+                st.success("Goal added.")
+                st.rerun()
+    if st.session_state.goals:
+        for idx, goal in enumerate(st.session_state.goals):
+            if goal["currency"] != st.session_state.currency:
+                st.caption(f"{goal['name']}: saved in {goal['currency']}; change budget currency to view matching goals.")
+                continue
+            months = goal["months"]
+            est_date = (pd.Timestamp.today().normalize() + pd.DateOffset(months=months)).date() if months else date.today()
+            st.markdown(f"**{goal['name']}** — {money(goal['target'], goal['currency'])}")
+            st.progress(min(goal["saved"] / goal["target"], 1.0))
+            st.write(f"Monthly contribution: {money(goal['monthly'], goal['currency'])} · Estimated time: {months} month(s) · Approx. target date: {est_date}")
+            if st.button("Delete goal", key=f"del_goal_{idx}"):
+                st.session_state.goals.pop(idx)
+                st.rerun()
+            st.divider()
+    else:
+        st.info("No goals added yet.")
+
+with tabs[4]:
+    st.subheader("🧠 Your Financial Agent")
+    st.caption("PennyPilot calculates the financial facts first. Optional AI explains those facts in plain language.")
+
+    coach_lines, coach_context = build_financial_agent(
+        st.session_state.budget, df, st.session_state.currency, st.session_state.goals
+    )
+
+    if df.empty:
+        st.info("Add several expenses first. The Financial Agent needs recorded spending to produce meaningful personal analysis.")
+    else:
+        st.markdown("### 🔎 1. Financial Snapshot")
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Recorded spending", money(coach_context["spent"], st.session_state.currency))
+        k2.metric("Budget used", f"{coach_context['ratio']:.0%}")
+        k3.metric("Budget health", coach_context["budget_status"])
+        k4.metric("Month-end pace", money(coach_context["projected"], st.session_state.currency))
+
+        status = coach_context["budget_status"]
+        if status == "Over budget":
+            st.error("Recorded spending has already exceeded the stated monthly budget.")
+        elif status == "At risk":
+            st.warning("Your current spending pace indicates a possible month-end budget overrun.")
+        elif status == "Watch":
+            st.warning("A large portion of the budget has already been recorded.")
+        else:
+            st.success("Recorded spending is currently below the budget threshold.")
+
+        st.markdown("### 📊 2. What's Driving Your Spending?")
+        cat = pd.Series(coach_context["category_totals"]).sort_values(ascending=False)
+        left, right = st.columns(2)
+        with left:
+            st.dataframe(
+                pd.DataFrame({
+                    "Category": cat.index,
+                    "Recorded amount": [money(x, st.session_state.currency) for x in cat.values],
+                    "% of spending": [f"{x / cat.sum():.0%}" for x in cat.values]
+                }),
+                use_container_width=True, hide_index=True
+            )
+        with right:
+            fig = px.bar(
+                pd.DataFrame({"Category": cat.index, "Amount": cat.values}),
+                x="Amount", y="Category", orientation="h",
+                title="Recorded spending by category"
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("### 🎯 3. What Should You Change?")
+        for i, action in enumerate(coach_context["recommended_actions"], 1):
+            st.write(f"**{i}.** {action}")
+
+        lt = coach_context.get("largest_transaction")
+        if lt:
+            st.info(
+                f"Largest recorded transaction: **{lt['merchant']} — {money(lt['amount'], st.session_state.currency)}** "
+                f"({lt['category']}). Review whether it was planned, one-off, or recurring."
+            )
+
+        st.markdown("### 🎯 4. Goal Impact")
+        if coach_context["goal_analysis"]:
+            for goal in coach_context["goal_analysis"]:
+                st.markdown(f"**{goal['name']}**")
+                st.write(
+                    f"Remaining: **{money(goal['gap'], st.session_state.currency)}** · "
+                    f"Current contribution: **{money(goal['monthly'], st.session_state.currency)}/month** · "
+                    f"Estimated time: **{goal['current_months']} month(s)**."
+                )
+                if goal["opportunities"]:
+                    best = goal["opportunities"][0]
+                    st.success(
+                        f"A 20% reduction in {best['category']} would free about "
+                        f"{money(best['potential_saving'], st.session_state.currency)}/month "
+                        f"and could shorten the simple estimate by about {best['months_saved']} month(s)."
+                    )
+        else:
+            st.caption("Add a savings goal to see how spending changes could affect your target timeline.")
+
+        if coach_context.get("goal_optimization"):
+            st.markdown("**Goal optimization scenarios**")
+            for opt in coach_context["goal_optimization"]:
+                if not opt["scenarios"]:
+                    st.caption(f"{opt['name']}: no discretionary-spending scenario is available yet.")
+                    continue
+                scenario_rows = [{
+                    "Scenario": s["label"],
+                    "Extra monthly contribution": money(s["extra"], st.session_state.currency),
+                    "Estimated time": f"{s['months']} month(s)",
+                    "Months saved": s["months_saved"],
+                } for s in opt["scenarios"]]
+                st.write(f"**{opt['name']}** — illustrative scenarios only:")
+                st.dataframe(pd.DataFrame(scenario_rows), use_container_width=True, hide_index=True)
+
+        st.markdown("### 📈 Spending Trend & Recurring Patterns")
+        trend = coach_context.get("trend", {})
+        if trend.get("monthly") is not None and not trend["monthly"].empty:
+            if trend.get("change_pct") is None:
+                st.info("There is only one recorded month, so a month-over-month trend is not available yet.")
+            else:
+                change = trend["change_pct"]
+                if change > 0.10:
+                    st.warning(f"Recorded spending is up {change:.0%} versus the previous recorded month.")
+                elif change < -0.10:
+                    st.success(f"Recorded spending is down {abs(change):.0%} versus the previous recorded month.")
+                else:
+                    st.info(f"Recorded spending is relatively stable ({change:+.0%} versus the previous recorded month).")
+        recurring = coach_context.get("recurring_expenses", [])
+        if recurring:
+            st.markdown("**Possible recurring expenses — verify before relying on them**")
+            recurring_df = pd.DataFrame([{
+                "Merchant": r["merchant"],
+                "Category": r["category"],
+                "Pattern": r["frequency"],
+                "Typical amount": money(r["typical_amount"], st.session_state.currency),
+                "Occurrences": r["occurrences"],
+            } for r in recurring])
+            st.dataframe(recurring_df, use_container_width=True, hide_index=True)
+        else:
+            st.caption("No strong recurring pattern was detected from the recorded transactions.")
+
+        st.markdown("### 📅 5. Your Next 7 Days")
+        top_disc = sorted(
+            [(c, float(coach_context["category_totals"].get(c, 0))) for c in DISCRETIONARY_CATEGORIES
+             if float(coach_context["category_totals"].get(c, 0)) > 0],
+            key=lambda x: x[1], reverse=True
+        )
+        weekly = []
+        if top_disc:
+            c, value = top_disc[0]
+            weekly.append(f"Set a personal ceiling for {c}; recorded monthly spending is already {money(value, st.session_state.currency)}.")
+        weekly.append(f"Before adding a non-essential expense, check that {money(max(coach_context['remaining'], 0), st.session_state.currency)} remains available.")
+        if coach_context["goal_analysis"]:
+            weekly.append(f"Keep your {coach_context['goal_analysis'][0]['name']} contribution separate from everyday spending if possible.")
+        for item in weekly[:3]:
+            st.write("• " + item)
+
+    st.divider()
+    st.markdown("### 🤖 Optional AI Explanation")
+    st.caption("AI receives calculated financial facts; it is not asked to invent transactions or provide security-specific buy/sell instructions.")
+
+    if st.button("Generate personalized AI explanation", type="primary", disabled=df.empty):
+        prompt = f"""
+You are the explanation layer of PennyPilot AI.
+
+Use ONLY these calculated facts. Do not invent transactions or financial history.
+Do not recommend a particular stock, crypto token, fund, security, or gold product.
+Do not give buy/sell instructions. Keep the advice practical and non-judgmental.
+
+Country: {st.session_state.country}
+Currency: {st.session_state.currency}
+Monthly budget: {st.session_state.budget:.2f}
+Recorded spending: {coach_context['spent']:.2f}
+Remaining budget: {coach_context['remaining']:.2f}
+Budget used: {coach_context['ratio']:.0%}
+Budget health: {coach_context['budget_status']}
+Month-end pace estimate: {coach_context['projected']:.2f}
+Transaction count: {len(df)}
+Largest category: {coach_context['top_category']}
+Largest category amount: {coach_context['top_category_amount']:.2f}
+Largest category share: {coach_context['top_category_pct']:.0%}
+Discretionary spending: {coach_context['discretionary']:.2f}
+Essential spending: {coach_context['essential']:.2f}
+Category totals: {coach_context['category_totals']}
+Largest transaction: {coach_context['largest_transaction']}
+Goal analysis: {coach_context['goal_analysis']}
+Goal optimization scenarios: {coach_context['goal_optimization']}
+Spending trend: {coach_context['trend'].get('trend_direction')} / change={coach_context['trend'].get('change_pct')}
+Possible recurring expenses: {coach_context['recurring_expenses']}
+Recommended actions: {coach_context['recommended_actions']}
+
+Respond using exactly these sections:
+## My financial picture
+2-3 sentences based on the numbers.
+
+## What is driving it
+3 bullets tied to actual categories, trends, or recurring patterns.
+
+## What I would focus on next
+3 concrete actions.
+
+## Impact on my goal
+Explain the most relevant goal effect, or say no goal was provided.
+
+## One thing to watch
+One specific caution based on the data.
+
+End by saying the analysis uses only recorded expenses and is educational, not regulated financial advice.
+"""
+        with st.spinner("Analyzing your actual spending and goals..."):
+            answer, error = try_llm_advice(prompt)
+        if answer:
+            st.markdown(answer)
+        else:
+            st.error(error or "The AI explanation could not be generated.")
+            st.info("The deterministic Financial Agent above remains available without the AI service.")
+
+
+with tabs[5]:
+    st.subheader("Export and session data")
+    all_df = st.session_state.transactions.copy()
+    if all_df.empty:
+        st.info("No transactions to export yet.")
+    else:
+        st.dataframe(all_df[DISPLAY_COLUMNS], use_container_width=True, hide_index=True)
+        st.download_button("Export all transactions as CSV", all_df[DISPLAY_COLUMNS].to_csv(index=False).encode("utf-8"), file_name="pennypilot_all_transactions.csv", mime="text/csv")
+    st.warning("This MVP does not have accounts or a permanent database. Session data is not suitable for long-term financial recordkeeping.")
+    if st.button("Clear all session transactions and goals", type="secondary"):
+        st.session_state.transactions = pd.DataFrame(columns=COLUMNS)
+        st.session_state.goals = []
+        for key in ["ocr_text", "ocr_error", "ocr_merchant", "ocr_amount", "bulk_expense_file", "bulk_preview", "bulk_uploaded_signature", "bulk_import_message"]:
+            st.session_state.pop(key, None)
+        st.success("Session records cleared.")
+        st.rerun()
+
+st.divider()
+st.caption("PennyPilot AI · Hackathon prototype · Estimates are not guarantees. Verify all receipt data and consult a qualified professional for regulated financial decisions.")
